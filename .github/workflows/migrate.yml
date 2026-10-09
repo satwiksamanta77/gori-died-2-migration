@@ -1,0 +1,79 @@
+name: Telegram Migration (Gori Died 2)
+
+on:
+  repository_dispatch:
+    types: [migrate]
+  workflow_dispatch:
+
+jobs:
+  migrate:
+    runs-on: ubuntu-latest
+    timeout-minutes: 59
+    concurrency:
+      group: gori2-${{ github.event.client_payload.shard || format('manual-{0}', github.run_id) }}
+      cancel-in-progress: false
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install deps
+        run: pip install -r requirements.txt
+
+      - name: Run migration worker
+        env:
+          TELEGRAM_API_ID: ${{ secrets.TELEGRAM_API_ID }}
+          TELEGRAM_API_HASH: ${{ secrets.TELEGRAM_API_HASH }}
+          TELEGRAM_SESSION: ${{ secrets.TELEGRAM_SESSION }}
+          TELEGRAM_SESSION_0: ${{ secrets.TELEGRAM_SESSION_0 }}
+          TELEGRAM_SESSION_1: ${{ secrets.TELEGRAM_SESSION_1 }}
+          TELEGRAM_SESSION_2: ${{ secrets.TELEGRAM_SESSION_2 }}
+          TELEGRAM_SESSION_3: ${{ secrets.TELEGRAM_SESSION_3 }}
+          TELEGRAM_SESSION_4: ${{ secrets.TELEGRAM_SESSION_4 }}
+          OLD_CHAT_ID: ${{ secrets.OLD_CHAT_ID }}
+          NEW_CHAT_ID: ${{ secrets.NEW_CHAT_ID }}
+          WORKER_URL: ${{ secrets.WORKER_URL }}
+          MIGRATE_KEY: ${{ secrets.MIGRATE_KEY }}
+          # Bot API copyMessage fallback for MTProto-unservable files (2026-09-11).
+          # Unset secret => empty string => fallback dormant, zero behavior change.
+          # Needs the bot in BOTH chats (post rights in dest). No size limit.
+          BOT_TOKEN: ${{ secrets.BOT_TOKEN }}
+          TIME_BUDGET_MIN: '48'
+          SHARD: ${{ github.event.client_payload.shard || 'manual' }}
+          # Unbuffered stdout. `print()` in migrate.py does not pass flush=True,
+          # and stdout to a non-TTY is 8 KB block-buffered, so when GitHub
+          # SIGKILLs the job at `timeout-minutes` the whole buffer dies with the
+          # process. That is why every cancelled run looked like it had crashed
+          # immediately: the log showed nothing past the first flushed [DIAG]
+          # line even though the worker had been transferring for 59 minutes.
+          # An unflushed log is worse than no log - it points at the wrong place.
+          PYTHONUNBUFFERED: '1'
+          # DIAGNOSTICS. Every failure now emits one `[DIAG] {json}` line with the
+          # document identity, how many bytes ever arrived, and the telethon
+          # records that preceded the give-up. Without the telethon logger the
+          # only message we ever saw was "Request was unsuccessful N time(s)",
+          # which names no cause at all.
+          DIAG: '1'
+          TELETHON_LOG: ${{ github.event.client_payload.telethon_log || 'INFO' }}
+          DIAG_FILE: ${{ runner.temp }}/migrate_diag.jsonl
+        run: python migrate.py
+
+      # Always: a crashed or rate-limited run is exactly when the log matters.
+      - name: Diagnostics artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: diag-${{ github.event.client_payload.shard || 'manual' }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/migrate_diag.jsonl
+          if-no-files-found: ignore
+          retention-days: 14
+
+      # Surfaces the pattern on the run page itself: one line per failing
+      # message, and whether Telegram ever sent a single byte for it.
+      - name: Failure pattern
+        if: always()
+        run: python diag_report.py "${{ runner.temp }}/migrate_diag.jsonl"
